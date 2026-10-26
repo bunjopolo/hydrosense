@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hydrosense"
+version = "0.2.0"
+description = "Tag-driven hydro asset modelling from CSV/Excel and live PI Web API data"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.0,<3",
+  "pandas>=2.2,<3",
+  "scikit-learn>=1.5,<2",
+  "joblib>=1.4,<2",
+  "requests>=2.32,<3",
+  "openpyxl>=3.1,<4",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["hydrosense*"]

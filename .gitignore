@@ -1,0 +1,37 @@
+# Local environments, generated output and private runtime state
+.venv/
+node_modules/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.tsbuildinfo
+artifacts/
+data/
+reports/
+lightning_logs/
+webapp/dist/
+webapp/.next/
+webapp/.wrangler/
+webapp/.vinext/
+.codex/
+.agents/
+.aws/
+
+# The previous AirSense project is retained locally, not shipped with HydroSense.
+legacy/
+notebooks/
+src/airsense/
+configs/model.json
+configs/simulation.json
+scripts/build_notebooks.py
+scripts/generate_datasets.py
+scripts/prepare_dashboard_data.py
+tests/test_pipeline.py
+webapp/public/data/
