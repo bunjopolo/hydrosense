@@ -18,35 +18,6 @@ Upgrading from the earlier selected-target version: update the code, rerun
 `python -m pip install -e .`, and retrain. Old regression artifacts cannot provide
 all-tag temporal forecasts; the app retains them but asks for a new model.
 
-## Windows executable (simplest setup)
-
-Download **HydroSense.exe** from the [latest Windows release](https://github.com/bunjopolo/hydrosense/releases/latest).
-Double-click it and the dashboard opens in your default browser. Python, Node.js
-and Git are bundled or unnecessary on the work computer. Leave the console window
-open while monitoring; closing it stops the app. The large ML runtime unpacks at
-startup, so the first window can take a little time to appear.
-
-Models, settings and run logs are stored in `%LOCALAPPDATA%\HydroSense` and survive
-replacing the executable. To migrate existing local settings/models, close both
-apps and copy the contents of your old `artifacts\hydro` directory into that folder.
-Passwords remain session-only. The Windows integrated PI authentication adapter
-is included. Your computer still needs network access to PI.
-
-For a slower computer, train with the notebook and use the executable for inference.
-While the app is closed, activate your trusted exported model with:
-
-```powershell
-.\HydroSense.exe activate --model C:\path\hydro-model.joblib --trust-model
-```
-
-The pilot executable is unsigned. If company policy blocks it, request IT approval.
-Packaging removes installation steps but does not reduce training CPU or RAM needs.
-
-Maintainers can build and publish a tested executable using the **Windows executable**
-GitHub Actions workflow. It builds the bundled dashboard, installs CPU PyTorch,
-packages with PyInstaller, tests real training/inference inside the executable,
-and publishes a public release with its SHA-256 checksum and dependency versions.
-
 ## Start locally
 
 Python 3.11+ and Node 22.13+ are required. From this directory:
@@ -67,9 +38,9 @@ and the dashboard on port 5173. Stop with Ctrl+C. Both services must be running;
 the Python backend runs the models and stores the artifacts. This is a local
 application; publishing only the web UI would not deploy the ML service.
 
-For a Windows work computer, install Python 3.12, Node.js 22.13+ and Git, then
-run the following in PowerShell from the cloned repository (no activation is
-needed):
+For a Windows work computer, use organization-approved Python 3.12 and Node.js
+22.13+ installations. Download and extract the source ZIP above, or clone with Git.
+Run the following in PowerShell from the repository folder (no activation is needed):
 
 ```powershell
 py -3.12 -m venv .venv
@@ -93,6 +64,26 @@ authentication, install its optional adapter with
 `.venv\Scripts\python -m pip install requests-negotiate-sspi`, then choose Windows
 integrated authentication in the app. The Python process must run as an account
 with PI read access. The work computer must be able to reach the PI Web API.
+
+### Run the browser dashboard with one Python process
+
+After installing the dependencies above, build the dashboard once:
+
+```powershell
+Push-Location webapp
+npm run build:desktop
+Pop-Location
+.venv\Scripts\python -m hydrosense.desktop
+```
+
+The Python launcher serves both the dashboard and API, then opens your browser.
+Leave that terminal open while monitoring and press Ctrl+C to stop. Rebuild the
+dashboard after pulling UI updates. Models and settings are stored in
+`artifacts/hydro`; PI passwords remain session-only.
+
+Windows executable releases are no longer distributed. If you previously used
+one, its data remains in `%LOCALAPPDATA%\HydroSense`. With both apps stopped, copy
+that folder's contents into `artifacts\hydro` to reuse your models and settings.
 
 The GitHub repository contains only HydroSense. Local copies of the former
 AirSense implementation, plant files, trained models, generated reports and
