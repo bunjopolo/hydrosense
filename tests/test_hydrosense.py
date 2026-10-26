@@ -245,6 +245,111 @@ class RealModelIntegrationTests(unittest.TestCase):
             self.assertTrue(state.snapshot()['model']['compatible'])
             self.assertEqual(state.source, 'notebook')
 
+    def model_bytes(self, bundle=None):
+        stream = io.BytesIO()
+        joblib.dump(self.bundle if bundle is None else bundle, stream)
+        return stream.getvalue()
+
+    def test_in_app_model_import_activates_persists_and_resets_old_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(directory)
+            state.training = state.replay = self.frame
+            state.training_ranges, state.training_revision = [[0, 20]], 'previous-import'
+            state.events, state.results = [{'old': True}], [{'old': True}]
+            state.action('/connection', {'connector': 'piconnect', 'data_server': 'example-archive'})
+            content = self.model_bytes()
+            result = state.import_model(io.BytesIO(content), len(content), trusted=True)
+            self.assertIn('2 tags', result['message'])
+            self.assertTrue(state.snapshot()['model']['compatible'])
+            self.assertEqual(state.config, self.bundle['config'])
+            self.assertEqual(state.settings['data_server'], 'example-archive')
+            self.assertIsNone(state.training)
+            self.assertIsNone(state.replay)
+            self.assertIsNone(state.training_revision)
+            self.assertEqual(state.results, [])
+            self.assertEqual(state.events, [])
+            self.assertEqual(state.source, 'notebook')
+            reloaded = State(directory)
+            self.assertTrue(reloaded.snapshot()['model']['compatible'])
+            self.assertEqual(self.score_rows(reloaded.bundle), self.score_rows(self.bundle))
+            self.assertFalse(list(Path(directory).glob('*.upload')))
+
+    def test_model_import_requires_trust_and_idle_before_deserializing(self):
+        from hydrosense.service import MAX_MODEL_BYTES
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(directory)
+            with patch('hydrosense.service.load_trusted_model') as load:
+                with self.assertRaisesRegex(ValueError, 'trust'):
+                    state.import_model(io.BytesIO(b'bad'), 3)
+                for length in [0, MAX_MODEL_BYTES + 1]:
+                    with self.assertRaisesRegex(ValueError, '512 MB'):
+                        state.import_model(io.BytesIO(), length, trusted=True)
+                state.mode = 'live'
+                with self.assertRaisesRegex(ValueError, 'Stop live'):
+                    state.import_model(io.BytesIO(b'bad'), 3, trusted=True)
+                state.mode = 'idle'
+                state.job = {'status': 'training'}
+                with self.assertRaisesRegex(ValueError, 'wait for training'):
+                    state.import_model(io.BytesIO(b'bad'), 3, trusted=True)
+                load.assert_not_called()
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_bad_model_import_preserves_active_model_and_removes_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(directory)
+            content = self.model_bytes()
+            state.import_model(io.BytesIO(content), len(content), trusted=True)
+            old_bundle = state.bundle
+            before = {p.name: p.read_bytes() for p in Path(directory).iterdir()}
+            broken = copy.deepcopy(self.bundle)
+            broken['models'][self.config['assets'][0]['id']]['tft_state'] = {}
+            for bad, length in [(b'not a model', 11), (b'truncated', 200),
+                                (self.model_bytes({'version': 1}), None), (self.model_bytes(broken), None)]:
+                with self.assertRaises(ValueError):
+                    state.import_model(io.BytesIO(bad), length or len(bad), trusted=True)
+                self.assertIs(state.bundle, old_bundle)
+                self.assertEqual({p.name: p.read_bytes() for p in Path(directory).iterdir()}, before)
+            self.assertTrue(State(directory).snapshot()['model']['compatible'])
+
+    def test_model_import_rolls_back_configuration_when_manifest_save_fails(self):
+        from hydrosense.service import atomic_json
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(directory)
+            old_config = copy.deepcopy(state.config)
+            content = self.model_bytes()
+            def save(path, value):
+                if path.name == 'active.json':
+                    raise OSError('disk failure')
+                atomic_json(path, value)
+            with patch('hydrosense.service.atomic_json', side_effect=save):
+                with self.assertRaises(OSError):
+                    state.import_model(io.BytesIO(content), len(content), trusted=True)
+            self.assertIsNone(state.bundle)
+            self.assertEqual(State(directory).config, old_config)
+            self.assertFalse(list(Path(directory).glob('*.joblib')))
+            self.assertFalse(list(Path(directory).glob('*.upload')))
+
+    def test_binary_model_upload_route(self):
+        from hydrosense.service import handler_for
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(directory)
+            content = self.model_bytes()
+            handler_class = handler_for(state)
+            handler = handler_class.__new__(handler_class)
+            handler.path = '/model/import'
+            handler.allowed = lambda: True
+            handler.connection = Mock()
+            handler.send = Mock()
+            handler.headers = {'Content-Type': 'application/octet-stream', 'Content-Length': str(len(content))}
+            handler.rfile = io.BytesIO(content)
+            handler.do_POST()
+            self.assertEqual(handler.send.call_args.args[0], 400)
+            self.assertIsNone(state.bundle)
+            handler.headers['X-HydroSense-Trust-Model'] = 'true'
+            handler.do_POST()
+            self.assertEqual(handler.send.call_args.args[0], 200)
+            self.assertTrue(state.snapshot()['model']['compatible'])
+
     def test_test_block_never_fits_transforms_or_thresholds(self):
         modified = self.frame.copy()
         modified.loc[int(len(modified) * .8):, 'B.temp [C]'] += 1000

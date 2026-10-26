@@ -300,14 +300,28 @@ pipeline** as the app, discovers all numeric tags, evaluates later history and
 downloads a model package. Use an approved environment for plant data; Colab
 requires uploading the file there. CPU training is also supported.
 
-Extract your downloaded package on the work computer. Stop HydroSense, then
-activate the model you trained (PowerShell example):
+Extract your downloaded package on the work computer. In **Data & training →
+Load a model from your computer**, click **Choose model file**, browse to the
+folder and select `hydro-model.joblib`. Confirm that you trained or trust the
+model, then click **Load selected model**. The single file contains all unit
+settings, tag names and learned weights; the other exported files are reference
+reports and do not need to be selected.
+
+Loading verifies the model before activating it and returns to Monitor without
+restarting. It replaces the current unit configuration and clears imported
+training/replay data and observations. Your PI connection settings and previously
+saved models/logs are retained. The imported model remains active after restart.
+Stop live monitoring or pause replay first. The browser supports model files up
+to 512 MB; upload stays between the browser and local Python service.
+
+Alternatively, stop HydroSense and activate the model with the CLI (PowerShell):
 
 ```powershell
 .venv\Scripts\python -m hydrosense.cli activate --model C:\path\hydro-model.joblib --trust-model
 ```
 
-Restart the app and load a replay file or configure PI. Inference runs on CPU,
+Restart after CLI activation; in-app loading needs no restart. Load a replay file
+or configure PI. Inference runs on CPU,
 so the work computer does not need a GPU. Use matching dependency versions on
 both machines; the notebook includes a versions manifest. Only load trusted
 joblib artifacts: they contain executable Python serialization. Model weights,

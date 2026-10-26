@@ -18,6 +18,7 @@ import joblib
 import pandas as pd
 
 from .data import read_upload
+from .artifacts import load_trusted_model
 from .demo import generate
 from .model import MODEL_VERSION, Monitor, all_tags, config_for_frame, fingerprint, normalize_config, numeric_tags, train, validate_config
 from .pi import create_client
@@ -26,6 +27,7 @@ from .selection import normalize_ranges, selected_frame, preview
 
 ROOT = resource_root()
 ALLOWED_ORIGINS = {f'http://{host}:{port}' for host in ('localhost', '127.0.0.1') for port in (5173, 3000)}
+MAX_MODEL_BYTES = 512 * 1024 * 1024
 
 
 def atomic_json(path, value):
@@ -105,6 +107,50 @@ class State:
         self.results, self.history, self.events = [], [], []
         self.signal_states, self.logged_stamps = {}, {}
         self.updated_at, self.run_path = None, None
+
+    def import_model(self, stream, length, trusted=False):
+        with self.lock:
+            self.idle()
+            if trusted is not True:
+                raise ValueError('Confirm that you trained or trust this model before loading it.')
+            if not 0 < length <= MAX_MODEL_BYTES:
+                raise ValueError('Choose a model between 1 byte and 512 MB. Use CLI activation for larger models.')
+            name = f'model-{uuid.uuid4().hex}.joblib'
+            staged = self.directory / (name + '.upload')
+            target = self.directory / name
+            try:
+                # Stream directly to disk: no base64 copy or browser-sized memory buffer.
+                remaining = length
+                with staged.open('wb') as output:
+                    while remaining:
+                        chunk = stream.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise ValueError('Model upload was interrupted. Select the file again.')
+                        output.write(chunk)
+                        remaining -= len(chunk)
+                bundle, monitor = load_trusted_model(staged)
+                staged.replace(target)
+                try:
+                    atomic_json(self.directory / 'config.json', bundle['config'])
+                    atomic_json(self.directory / 'active.json', {'file': name, 'source': 'notebook'})
+                except Exception:
+                    atomic_json(self.directory / 'config.json', self.config)
+                    raise
+            except Exception:
+                target.unlink(missing_ok=True)
+                raise
+            finally:
+                staged.unlink(missing_ok=True)
+            self.config, self.bundle, self.monitor = bundle['config'], bundle, monitor
+            self.source, self.mode = 'notebook', 'idle'
+            self.training = self.replay = None
+            self.training_ranges, self.training_revision = [], None
+            self.training_source, self.replay_index = 'csv', 0
+            self.reset_observations()
+            self.migration_note = self.error = None
+            self.job = {'status': 'idle'}
+            unit_count = len(self.config['assets'])
+            return {'message': f'Model loaded: {unit_count} {"unit" if unit_count == 1 else "units"}, {len(all_tags(self.config))} tags. Ready for replay or live PI.'}
 
     def record(self, results, timestamp):
         self.results, self.updated_at = results, timestamp
@@ -382,7 +428,7 @@ def handler_for(state, static_directory=None):
                 return self.send(403, {'error': 'Origin not allowed'})
             self.send_response(204)
             self.send_header('Access-Control-Allow-Origin', self.headers.get('Origin', 'http://localhost:5173'))
-            self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-HydroSense-Trust-Model')
             self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
             self.end_headers()
 
@@ -442,6 +488,13 @@ def handler_for(state, static_directory=None):
             if not self.allowed():
                 return self.send(403, {'error': 'Origin not allowed'})
             try:
+                if self.path == '/model/import':
+                    if self.headers.get('Content-Type') != 'application/octet-stream':
+                        raise ValueError('Expected a binary .joblib model file.')
+                    self.connection.settimeout(60)
+                    self.send(200, state.import_model(self.rfile, int(self.headers.get('Content-Length', '0')),
+                                                     trusted=self.headers.get('X-HydroSense-Trust-Model') == 'true'))
+                    return
                 if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
                     raise ValueError('Expected application/json')
                 length = int(self.headers.get('Content-Length', '0'))

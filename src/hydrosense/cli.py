@@ -7,7 +7,8 @@ from pathlib import Path
 import joblib
 
 from .data import read_file
-from .model import MODEL_VERSION, Monitor, all_tags, config_for_frame, fingerprint, train
+from .artifacts import load_trusted_model
+from .model import Monitor, all_tags, config_for_frame, train
 
 
 def main():
@@ -58,10 +59,7 @@ def activate(path, directory=None):
     # joblib is executable serialization. Caller must explicitly trust this model.
     from .service import atomic_json
     from .runtime import data_directory
-    bundle = joblib.load(path)
-    if bundle.get('version') != MODEL_VERSION or bundle.get('config_hash') != fingerprint(bundle['config']):
-        raise ValueError('Expected a matching all-tag HydroSense model. Retrain with this version.')
-    Monitor(bundle)  # Verify all weights and fitted preprocessors before activation.
+    bundle, _ = load_trusted_model(path)
     directory = Path(directory or data_directory())
     directory.mkdir(parents=True, exist_ok=True)
     name = f'model-{uuid.uuid4().hex}.joblib'
