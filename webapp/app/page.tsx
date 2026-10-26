@@ -10,7 +10,7 @@ type Result = { id: string; name: string; kind: string; status: string; detail: 
 type Report = { id: string; name: string; rows: number; excluded_rows: number; fit_rows: number; calibration_rows: number; test_rows: number; test_windows: number; test_flag_rate: number; tags: { tag: string; mae: number; baseline_mae: number; tolerance: number }[] };
 type Connection = { url?: string; data_server?: string; auth?: string; username?: string; ca_bundle?: string; web_ids?: Record<string, string>; has_secret?: boolean };
 type Notice = { id: string; timestamp: string; unit: string; tag: string; status: string; actual: number | null; expected: number | null; ratio: number | null };
-type State = { config: Config; connection: Connection; job: { status: string; error?: string; message?: string }; mode: string; source: string; error: string | null; migration_note?: string; results: Result[]; history: { timestamp: string; assets: Result[] }[]; events: Notice[]; has_export: boolean; sample_seconds: number | null; updated_at: string | null; training_rows: number; replay_rows: number; replay_index: number; model: { created_at: string; reports: Report[]; compatible: boolean } | null };
+type State = { config: Config; connection: Connection; job: { status: string; error?: string; message?: string; percent?: number }; mode: string; source: string; error: string | null; migration_note?: string; results: Result[]; history: { timestamp: string; assets: Result[] }[]; events: Notice[]; has_export: boolean; sample_seconds: number | null; updated_at: string | null; training_rows: number; replay_rows: number; replay_index: number; model: { created_at: string; reports: Report[]; compatible: boolean } | null };
 type Inspection = { columns: string[]; numeric_columns: string[]; rows: number };
 const API = "http://127.0.0.1:8765";
 const COLAB = "https://colab.research.google.com/github/bunjopolo/hydrosense/blob/main/notebooks/hydrosense_training.ipynb";
@@ -77,6 +77,7 @@ export default function Home() {
     const next = await request<State>("/status");
     setState(next); setOffline(false);
     if (jobStatus.current === "training" && next.job.status === "complete") setNotice("Training complete. Every configured tag now has a forecast model.");
+    if (jobStatus.current !== "training" && next.job.status === "training") setNotice("");
     jobStatus.current = next.job.status;
     if (!initialized.current) {
       setConfigText(JSON.stringify(next.config, null, 2)); setTimestampColumn(next.config.timestamp_column);
@@ -143,9 +144,14 @@ export default function Home() {
     {notice && <div role="status" className="banner">{notice}<button onClick={() => setNotice("")} aria-label="Dismiss message">×</button></div>}
     {state?.migration_note && <div className="banner warning">{state.migration_note}</div>}
     {state?.error && <div role="alert" className="banner warning">PI monitoring interrupted: {state.error}</div>}
-    {state?.job.status === "training" && <div className="banner">{state.job.message || "Preparing training…"}</div>}
+    {state?.job.status === "training" && <section className="training-progress" aria-label="Model training progress">
+      <div className="training-progress-heading"><strong>Training models</strong><span>{Math.floor(state.job.percent || 0)}%</span></div>
+      <progress aria-label="Training progress" max={100} value={state.job.percent || 0}/>
+      <p role="status">{state.job.message || "Preparing training…"}</p>
+      <small>Progress across training stages; remaining time varies by unit and model.</small>
+    </section>}
     {state?.job.status === "failed" && <div role="alert" className="banner warning">Training failed: {state.job.error}</div>}
-    {state?.model && !state.model.compatible && <div className="banner warning">Configuration changed. Retrain or activate a matching notebook model.</div>}
+    {state?.model && !state.model.compatible && state.job.status !== "training" && <div className="banner warning">Configuration changed. Retrain or activate a matching notebook model.</div>}
 
     {tab === "Monitor" && <>
       <div className="unit-toolbar"><label>Unit<select value={unit?.id || ""} onChange={e => setSelected(e.target.value)}>{config?.assets.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}</select></label><label>Visible history<select value={historyCount} onChange={e => setHistoryCount(Number(e.target.value))}>{[30, 60, 120, 360].map(n => <option key={n} value={n}>{n} observations</option>)}</select></label><div className="source-label"><span className="pill">{state?.mode === "live" ? "LIVE PI" : state?.source === "synthetic" ? "SYNTHETIC DEMO" : state?.mode === "replay" ? "FILE REPLAY" : "NOT RUNNING"}</span><small>{state?.updated_at ? `Last observation ${new Date(state.updated_at).toLocaleString()}` : "Awaiting observations"}</small></div></div>

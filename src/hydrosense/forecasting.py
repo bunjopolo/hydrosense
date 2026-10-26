@@ -60,6 +60,7 @@ def predict_dataset(model, dataset):
 
 
 def fit_stack(raw, timestamps, settings, progress):
+    progress('Preparing training windows', 0.)
     import lightning.pytorch as pl
     from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
     from pytorch_forecasting.data import MultiNormalizer, TorchNormalizer
@@ -113,9 +114,10 @@ def fit_stack(raw, timestamps, settings, progress):
         output_size=[3] * count if count > 1 else 3, optimizer='adam', log_interval=-1,
     )
     class Progress(pl.Callback):
-        def on_train_epoch_end(self, trainer, module):
-            progress(f'TFT epoch {trainer.current_epoch + 1}/{settings["epochs"]}')
-    progress(f'Training TFT forecasts for all {count} tags')
+        def on_train_batch_end(self, trainer, module, outputs, batch, batch_idx):
+            fraction = (trainer.current_epoch + (batch_idx + 1) / trainer.num_training_batches) / settings['epochs']
+            progress(f'TFT epoch {trainer.current_epoch + 1}/{settings["epochs"]}', .05 + .60 * fraction)
+    progress(f'Training TFT forecasts for all {count} tags', .05)
     trainer = pl.Trainer(max_epochs=settings['epochs'], accelerator='gpu' if use_cuda else 'cpu', devices=1,
                          logger=False, enable_checkpointing=False, enable_progress_bar=False,
                          enable_model_summary=False, num_sanity_val_steps=0, gradient_clip_val=.1,
@@ -124,7 +126,7 @@ def fit_stack(raw, timestamps, settings, progress):
         warnings.filterwarnings('ignore', message='.*does not have many workers.*')
         trainer.fit(model, train_dataloaders=training.to_dataloader(train=True, batch_size=settings['batch_size'], num_workers=0))
     model.eval().cpu()
-    progress('Calibrating forecast residuals on later history')
+    progress('Calibrating forecast residuals on later history', .65)
     cal_q, cal_actual, _ = predict_dataset(model, calibration)
     test_q, test_actual, previous = predict_dataset(model, testing)
     # All quantiles are normalized per tag. Sort only to correct crossing quantiles.
@@ -134,7 +136,7 @@ def fit_stack(raw, timestamps, settings, progress):
     test_error = np.abs(test_actual - test_q[..., 1]) * scale[None, None, :]
     baseline = np.abs(test_actual - previous[:, None, :]) * scale[None, None, :]
 
-    progress('Training Isolation Forest and LSTM sequence model')
+    progress('Training Isolation Forest', .75)
     iso = IsolationForest(n_estimators=100, random_state=42, n_jobs=1).fit(filled[:fit_end][complete[:fit_end]])
     iso_reference = -iso.score_samples(filled[fit_end:cal_end][complete[fit_end:cal_end]])
     # Reconstruct past sequences, never future targets; do not cross quality gaps.
@@ -152,7 +154,9 @@ def fit_stack(raw, timestamps, settings, progress):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(ae.parameters(), 1.)
             optimizer.step()
-        progress(f'LSTM epoch {epoch + 1}/{settings["epochs"]}')
+            fraction = (epoch + min(offset + settings['batch_size'], len(order)) / len(order)) / settings['epochs']
+            progress(f'LSTM epoch {epoch + 1}/{settings["epochs"]}', .80 + .15 * fraction)
+    progress('Evaluating LSTM reconstruction', .95)
     ae.eval().cpu()
     cal_starts = [i for i in range(max(fit_end + lookback, lookback), cal_end + 1, lookback) if not bad[i - lookback:i].any()]
     if not cal_starts:
@@ -171,6 +175,7 @@ def fit_stack(raw, timestamps, settings, progress):
               'excluded_rows': int((~complete).sum()), 'fit_windows': len(training), 'test_windows': len(testing),
               'mae': test_error.mean(axis=(0, 1)).tolist(), 'baseline_mae': baseline.mean(axis=(0, 1)).tolist(),
               'tolerance': tolerance[0].tolist(), 'test_flag_rate': float((test_error[:, 0, :] >= tolerance[0]).any(axis=1).mean())}
+    progress('Unit models trained and evaluated', 1.)
     return stack, report
 
 

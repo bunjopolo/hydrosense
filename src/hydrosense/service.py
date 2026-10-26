@@ -150,16 +150,18 @@ class State:
         if self.training is None:
             raise ValueError('Import a training CSV first.')
         config, frame = copy.deepcopy(self.config), self.training.copy()
-        self.job = {'status': 'training'}
+        self.job = {'status': 'training', 'percent': 0, 'message': 'Preparing training…'}
         self.mode = 'idle'
         def work():
             try:
-                def progress(message):
+                def progress(event):
                     with self.lock:
-                        self.job = {'status': 'training', 'message': message}
-                bundle = train(frame, config, progress)
+                        self.job = {'status': 'training', **event}
+                bundle = train(frame, config, progress_detail=progress)
+                progress({'percent': 97, 'message': 'Saving trained models…'})
                 name = f'model-{uuid.uuid4().hex}.joblib'
                 joblib.dump(bundle, self.directory / name)
+                progress({'percent': 99, 'message': 'Loading models for prediction…'})
                 monitor = Monitor(bundle)
                 with self.lock:
                     source = 'synthetic' if demo else 'csv'
@@ -169,11 +171,11 @@ class State:
                     self.source = source
                     self.reset_observations()
                     self.migration_note = None
-                    self.job = {'status': 'complete'}
+                    self.job = {'status': 'complete', 'percent': 100, 'message': 'Training complete. Models ready.'}
                     self.error = None
             except Exception as exc:
                 with self.lock:
-                    self.job = {'status': 'failed', 'error': str(exc)}
+                    self.job = {**self.job, 'status': 'failed', 'error': str(exc)}
         threading.Thread(target=work, daemon=True).start()
 
     def action(self, path, data):

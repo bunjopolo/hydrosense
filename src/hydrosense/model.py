@@ -113,7 +113,7 @@ def read_csv(text, timestamp_column, source_timezone=None):
     return frame.sort_values(timestamp_column).reset_index(drop=True)
 
 
-def train(frame, config, progress=lambda message: None):
+def train(frame, config, progress=lambda message: None, progress_detail=lambda event: None):
     from .forecasting import fit_stack
     config = validate_config(config)
     missing = set(all_tags(config)) - set(frame.columns)
@@ -126,14 +126,23 @@ def train(frame, config, progress=lambda message: None):
     if cadence <= 0 or not timestamps.is_monotonic_increasing or timestamps.has_duplicates:
         raise ValueError('Training timestamps must be ordered and unique.')
     models, reports = {}, []
-    for asset in config['assets']:
+    last_message = None
+    for unit_index, asset in enumerate(config['assets']):
         raw = frame[asset['tags']].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
         if asset.get('running'):
             index = asset['tags'].index(asset['running']['tag'])
             raw[raw[:, index] < asset['running'].get('min', 0)] = np.nan
         settings = {key: config[key] for key in ('lookback', 'horizon', 'epochs', 'batch_size', 'hidden_size', 'device')}
         settings['sample_seconds'] = cadence
-        stack, report = fit_stack(raw, timestamps, settings, lambda message: progress(f'{asset.get("name", asset["id"])}: {message}'))
+        def report_progress(message, fraction):
+            nonlocal last_message
+            message = f'{asset.get("name", asset["id"])}: {message}'
+            if message != last_message:
+                progress(message)
+                last_message = message
+            # Reserve the final 3% for service serialization and activation.
+            progress_detail({'message': message, 'percent': round(97 * (unit_index + round(fraction, 8)) / len(config['assets']), 1)})
+        stack, report = fit_stack(raw, timestamps, settings, report_progress)
         models[asset['id']] = stack
         reports.append({'id': asset['id'], 'name': asset.get('name', asset['id']), 'rows': len(frame),
                         **{k: v for k, v in report.items() if k not in ('mae', 'baseline_mae', 'tolerance')},

@@ -202,7 +202,8 @@ class RealModelIntegrationTests(unittest.TestCase):
         cls.config.update(lookback=8, horizon=3, epochs=1, hidden_size=8)
         cls.frame = generate(350).rename(columns={'U1.MW': 'A / load', 'U1.GB.TEMP': 'B.temp [C]'})
         cls.config['assets'][0]['tags'] = ['A / load', 'B.temp [C]']
-        cls.bundle = train(cls.frame, cls.config)
+        cls.progress_events = []
+        cls.bundle = train(cls.frame, cls.config, progress_detail=cls.progress_events.append)
 
     def score_rows(self, bundle):
         monitor = Monitor(bundle)
@@ -220,6 +221,16 @@ class RealModelIntegrationTests(unittest.TestCase):
         self.assertEqual(set(result['components']), {'isolation_forest', 'lstm_autoencoder'})
         for signal in result['signals']:
             self.assertGreater(pd.Timestamp(signal['forecast'][0]['timestamp']), pd.Timestamp(result['timestamp']))
+
+    def test_cpu_training_reports_batch_progress_without_premature_completion(self):
+        events = self.progress_events
+        percentages = [event['percent'] for event in events]
+        self.assertEqual(percentages, sorted(percentages))
+        self.assertEqual(percentages[0], 0)
+        self.assertEqual(percentages[-1], 97)  # Service still needs to save and activate.
+        for stage in ('TFT epoch 1/1', 'LSTM epoch 1/1'):
+            updates = [event['percent'] for event in events if stage in event['message']]
+            self.assertGreater(len(set(updates)), 1)
 
     def test_model_roundtrip_and_notebook_activation(self):
         from hydrosense.cli import activate
