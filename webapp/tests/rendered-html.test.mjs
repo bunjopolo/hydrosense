@@ -11,7 +11,9 @@ test("server renders HydroSense without legacy hospital content", async () => {
   assert.equal(response.status, 200);
   const html = await response.text();
   assert.match(html, /HydroSense/);
-  assert.match(html, /Know what normal looks like/);
+  assert.match(html, /Your whole unit, in view/);
   assert.match(html, /Load synthetic demo/);
+  assert.match(html, /All variable graphs/);
+  assert.match(html, /Variable notifications/);
   assert.doesNotMatch(html, /hospital|SmartAirSense|TFT median forecast/i);
 });

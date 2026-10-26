@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import copy
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,7 +17,7 @@ import pandas as pd
 
 from .data import read_upload
 from .demo import generate
-from .model import Monitor, all_tags, fingerprint, read_csv, train, validate_config
+from .model import MODEL_VERSION, Monitor, all_tags, config_for_frame, fingerprint, normalize_config, numeric_tags, train, validate_config
 from .pi import PIClient
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +36,12 @@ class State:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.config = json.loads((self.directory / 'config.json' if (self.directory / 'config.json').exists() else ROOT / 'configs/hydro/assets.json').read_text())
+        self.config = normalize_config(self.config)
+        self.events = []
+        self.signal_states = {}
+        self.logged_stamps = {}
+        self.run_path = None
+        self.migration_note = None
         self.settings = json.loads((self.directory / 'connection.json').read_text()) if (self.directory / 'connection.json').exists() else {}
         self.secret = ''
         self.bundle = None
@@ -59,13 +66,19 @@ class State:
                 raise ValueError('Invalid local model manifest.')
             self.bundle = joblib.load(self.directory / name)  # Only service-owned local files.
             self.source = metadata.get('source', 'csv')
-            self.monitor = Monitor(self.bundle)
+            if self.bundle.get('version') == MODEL_VERSION:
+                self.monitor = Monitor(self.bundle)
+            else:
+                self.bundle = None
+                self.migration_note = 'The earlier model predicted selected targets. Retrain to forecast every tag.'
 
     def snapshot(self):
         with self.lock:
             return copy.deepcopy({'config': self.config, 'connection': {**self.settings, 'has_secret': bool(self.secret)},
                 'job': self.job, 'mode': self.mode, 'source': self.source, 'error': self.error,
                 'results': self.results, 'history': self.history, 'updated_at': self.updated_at,
+                'events': self.events, 'migration_note': self.migration_note, 'has_export': self.run_path is not None,
+                'sample_seconds': self.bundle.get('sample_seconds') if self.bundle else None,
                 'training_rows': len(self.training) if self.training is not None else 0,
                 'replay_rows': len(self.replay) if self.replay is not None else 0, 'replay_index': self.replay_index,
                 'model': {'created_at': self.bundle['created_at'], 'reports': self.bundle['reports'],
@@ -79,11 +92,57 @@ class State:
         if not self.bundle or self.bundle['config_hash'] != fingerprint(self.config):
             raise ValueError('Train a model for the current asset configuration first.')
 
+    def reset_observations(self):
+        self.results, self.history, self.events = [], [], []
+        self.signal_states, self.logged_stamps = {}, {}
+        self.updated_at, self.run_path = None, None
+
     def record(self, results, timestamp):
-        self.results = results
-        self.updated_at = timestamp
-        self.history.append({'timestamp': timestamp, 'assets': results})
-        self.history = self.history[-120:]
+        self.results, self.updated_at = results, timestamp
+        # History holds actual and previously issued predictions; future arrays live only in the current result.
+        compact = copy.deepcopy(results)
+        for asset in compact:
+            for signal in asset['signals']:
+                signal.pop('forecast', None)
+        if not self.history or [a['timestamp'] for a in self.history[-1]['assets']] != [a['timestamp'] for a in compact]:
+            self.history.append({'timestamp': timestamp, 'assets': compact})
+            self.history = self.history[-360:]
+        rows = []
+        for asset in results:
+            for signal in asset['signals']:
+                key = (asset['id'], signal['tag'])
+                status = signal['status']
+                before = self.signal_states.get(key)
+                if status != before and (status in ('deviation', 'alert', 'data_quality') or (status == 'normal' and before in ('deviation', 'alert'))):
+                    self.events.append({'id': uuid.uuid4().hex, 'timestamp': timestamp, 'unit': asset['name'],
+                                        'tag': signal['tag'], 'status': status, 'actual': signal['actual'],
+                                        'expected': signal['expected'], 'ratio': signal['ratio']})
+                    self.events = self.events[-200:]
+                self.signal_states[key] = status
+                stamp = asset['timestamp']
+                if self.logged_stamps.get(key) == stamp:
+                    continue
+                self.logged_stamps[key] = stamp
+                rows.append({'timestamp': stamp, 'unit': asset['name'], 'tag': signal['tag'],
+                             'actual': signal['actual'], 'predicted': signal['expected'],
+                             'forecast_issued_at': signal.get('forecast_issued_at'),
+                             'residual': signal['residual'], 'deviation_ratio': signal['ratio'],
+                             'calibrated_band': signal['tolerance'], 'status': status,
+                             'consecutive': signal['consecutive'], 'model_created_at': self.bundle['created_at'],
+                             'source': 'pi' if self.mode == 'live' else 'replay',
+                             'isolation_forest': asset.get('components', {}).get('isolation_forest'),
+                             'lstm_autoencoder': asset.get('components', {}).get('lstm_autoencoder')})
+        if rows:
+            if self.run_path is None:
+                runs = self.directory / 'runs'
+                runs.mkdir(exist_ok=True)
+                self.run_path = runs / f'predictions-{uuid.uuid4().hex}.csv'
+            exists = self.run_path.exists()
+            with self.run_path.open('a', newline='', encoding='utf-8') as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                if not exists:
+                    writer.writeheader()
+                writer.writerows(rows)
         self.error = None
 
     def train_async(self, demo=False):
@@ -95,16 +154,21 @@ class State:
         self.mode = 'idle'
         def work():
             try:
-                bundle = train(frame, config)
+                def progress(message):
+                    with self.lock:
+                        self.job = {'status': 'training', 'message': message}
+                bundle = train(frame, config, progress)
                 name = f'model-{uuid.uuid4().hex}.joblib'
                 joblib.dump(bundle, self.directory / name)
+                monitor = Monitor(bundle)
                 with self.lock:
                     source = 'synthetic' if demo else 'csv'
                     atomic_json(self.directory / 'active.json', {'file': name, 'source': source})
                     self.bundle = bundle
-                    self.monitor = Monitor(bundle)
+                    self.monitor = monitor
                     self.source = source
-                    self.results, self.history = [], []
+                    self.reset_observations()
+                    self.migration_note = None
                     self.job = {'status': 'complete'}
                     self.error = None
             except Exception as exc:
@@ -119,7 +183,7 @@ class State:
                 self.config = validate_config(data)
                 atomic_json(self.directory / 'config.json', self.config)
                 self.training = self.replay = None
-                self.results, self.history = [], []
+                self.reset_observations()
                 self.mode = 'idle'
             elif path == '/csv':
                 self.idle()
@@ -127,14 +191,22 @@ class State:
                 missing = set(all_tags(self.config)) - set(frame.columns)
                 # Inspect accepts arbitrary tag headers before the user finishes mapping.
                 if data.get('purpose') == 'inspect':
-                    return {'columns': list(frame.columns), 'rows': len(frame), 'missing': sorted(missing),
+                    return {'columns': list(frame.columns), 'numeric_columns': numeric_tags(frame, data.get('timestamp_column') or self.config['timestamp_column']), 'rows': len(frame), 'missing': sorted(missing),
                             'preview': frame.head(5).astype(str).to_dict('records')}
+                if data.get('auto_configure') and data.get('purpose') != 'replay':
+                    candidate = {**self.config, 'timestamp_column': data.get('timestamp_column') or self.config['timestamp_column'],
+                                 'source_timezone': data.get('source_timezone', self.config.get('source_timezone', 'UTC'))}
+                    self.config = config_for_frame(frame, candidate, data.get('unit_name') or 'Hydro unit')
+                    atomic_json(self.directory / 'config.json', self.config)
+                    self.reset_observations()
+                    self.replay = None
+                    missing = set()
                 if missing:
-                    raise ValueError('Map CSV columns to assets first. Missing: ' + ', '.join(sorted(missing)))
+                    raise ValueError('File is missing model tags: ' + ', '.join(sorted(missing)))
                 if data.get('purpose') == 'replay':
                     self.replay, self.replay_index = frame, 0
                     self.mode = 'idle'
-                    self.history, self.results = [], []
+                    self.reset_observations()
                     if self.bundle:
                         self.monitor = Monitor(self.bundle)
                 else:
@@ -148,7 +220,9 @@ class State:
                 self.idle()
                 self.config = json.loads((ROOT / 'configs/hydro/assets.json').read_text())
                 atomic_json(self.directory / 'config.json', self.config)
-                self.training, self.replay = generate(), generate(360, 83, True, '2026-02-01')
+                self.config['epochs'] = 2
+                atomic_json(self.directory / 'config.json', self.config)
+                self.training, self.replay = generate(1200), generate(360, 83, True, '2026-02-01')
                 self.replay_index = 0
                 self.train_async(demo=True)
             elif path == '/replay':
@@ -159,8 +233,16 @@ class State:
                 if data.get('reset'):
                     self.replay_index = 0
                     self.monitor = Monitor(self.bundle)
-                    self.results, self.history = [], []
-                for _ in range(max(1, min(int(data.get('steps', 1)), 10))):
+                    self.reset_observations()
+                if 'seek' in data:
+                    target = max(0, min(int(data['seek']), len(self.replay) - 1))
+                    self.replay_index = max(0, target - self.config['lookback'] - 120)
+                    self.monitor = Monitor(self.bundle)
+                    self.reset_observations()
+                    steps = target - self.replay_index + 1
+                else:
+                    steps = max(1, min(int(data.get('steps', 1)), 10))
+                for _ in range(steps):
                     if self.replay_index >= len(self.replay):
                         break
                     row = self.replay.iloc[self.replay_index]
@@ -191,11 +273,15 @@ class State:
                 self.compatible()
                 if self.source == 'synthetic':
                     raise ValueError('Train on your healthy plant CSV before starting live PI monitoring.')
+                cadence = self.bundle['sample_seconds']
+                if abs(self.config.get('poll_seconds', 30) - cadence) > max(.001, cadence * .05):
+                    raise ValueError(f'PI polling must match the trained sampling cadence ({cadence:g} seconds). Update the configuration and retrain.')
                 client = PIClient(self.settings, self.secret)
                 self.monitor = Monitor(self.bundle)
                 self.stop_event = threading.Event()
                 self.mode = 'live'
-                self.history, self.results, self.error = [], [], None
+                self.reset_observations()
+                self.error = None
                 self.worker = threading.Thread(target=self.poll, args=(client, self.stop_event), daemon=True)
                 self.worker.start()
             elif path == '/live/stop':
@@ -221,7 +307,11 @@ class State:
                     self.error = str(exc)
                     self.results = []
                     self.monitor = Monitor(self.bundle)
-            stop_event.wait(self.config.get('poll_seconds', 30))
+            # Anchor polls to trained time buckets; inference/network time must not
+            # accumulate into skipped samples and repeated temporal warmups.
+            cadence = self.bundle['sample_seconds']
+            delay = cadence - datetime.now(timezone.utc).timestamp() % cadence
+            stop_event.wait(delay)
 
 
 def handler_for(state):
@@ -258,6 +348,19 @@ def handler_for(state):
         def do_GET(self):
             if not self.allowed():
                 return self.send(403, {'error': 'Origin not allowed'})
+            if self.path == '/export/predictions':
+                with state.lock:
+                    payload = state.run_path.read_bytes() if state.run_path else None
+                if payload is None:
+                    return self.send(404, {'error': 'No predictions have been logged yet.'})
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/csv; charset=utf-8')
+                self.send_header('Content-Disposition', 'attachment; filename=hydrosense-predictions.csv')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             if self.path != '/status':
                 return self.send(404, {'error': 'Not found'})
             self.send(200, state.snapshot())

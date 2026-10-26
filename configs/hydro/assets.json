@@ -1,12 +1,20 @@
 {
   "timestamp_column": "timestamp",
+  "source_timezone": "UTC",
   "poll_seconds": 30,
   "stale_seconds": 180,
   "max_skew_seconds": 120,
   "persistence": 3,
-  "assets": [
-    {"id": "u1-bearing", "name": "Unit 1 · Guide bearing", "kind": "Bearing", "inputs": ["U1.MW", "U1.SPEED", "U1.COOLING.TEMP"], "targets": ["U1.GB.TEMP", "U1.GB.VIB"], "running": {"tag": "U1.SPEED", "min": 100}},
-    {"id": "u1-generator", "name": "Unit 1 · Generator", "kind": "Generator", "inputs": ["U1.MW", "U1.COOLING.TEMP"], "targets": ["U1.STATOR.TEMP"], "running": {"tag": "U1.SPEED", "min": 100}},
-    {"id": "t1-transformer", "name": "Transformer 1", "kind": "Transformer", "inputs": ["T1.MVA", "SITE.AMBIENT"], "targets": ["T1.TOP.OIL.TEMP", "T1.WINDING.TEMP"]}
-  ]
+  "lookback": 24,
+  "horizon": 12,
+  "epochs": 10,
+  "batch_size": 64,
+  "hidden_size": 16,
+  "device": "cpu",
+  "assets": [{
+    "id": "unit-1",
+    "name": "Hydro unit 1",
+    "kind": "Hydro unit",
+    "tags": ["U1.MW", "U1.SPEED", "U1.COOLING.TEMP", "U1.GB.TEMP", "U1.GB.VIB", "U1.STATOR.TEMP", "T1.MVA", "SITE.AMBIENT", "T1.TOP.OIL.TEMP", "T1.WINDING.TEMP"]
+  }]
 }

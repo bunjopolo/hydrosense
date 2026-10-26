@@ -8,7 +8,7 @@ from .model import read_csv
 
 
 def read_upload(data, config):
-    timestamp = data.get('timestamp_column') if data.get('purpose') == 'inspect' else config['timestamp_column']
+    timestamp = data.get('timestamp_column') if (data.get('purpose') == 'inspect' or data.get('auto_configure')) else config['timestamp_column']
     timestamp = timestamp or config['timestamp_column']
     source_timezone = data.get('source_timezone', config.get('source_timezone'))
     if 'xlsx' in data:

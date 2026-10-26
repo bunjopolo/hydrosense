@@ -1,55 +1,91 @@
-"""One conditional normal-behaviour model per asset, shared by replay and PI."""
+"""Predict every tag from past observations, with independent per-tag alerts."""
 from __future__ import annotations
 
+import copy
 import csv
 import hashlib
 import io
 import json
 import re
-from numbers import Real
 from datetime import datetime, timezone
+from numbers import Real
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import ExtraTreesRegressor
+
+MODEL_VERSION = 2
+
+
+def normalize_config(config):
+    config = copy.deepcopy(config)
+    for asset in config.get('assets', []):
+        if 'tags' not in asset:
+            asset['tags'] = list(dict.fromkeys(asset.pop('inputs', []) + asset.pop('targets', []) +
+                                             ([asset['running']['tag']] if asset.get('running') else [])))
+    config.setdefault('lookback', 24)
+    config.setdefault('horizon', 12)
+    config.setdefault('epochs', 10)
+    config.setdefault('batch_size', 64)
+    config.setdefault('hidden_size', 16)
+    config.setdefault('device', 'cpu')
+    return config
 
 
 def validate_config(config):
     if not isinstance(config, dict) or not config.get('timestamp_column'):
-        raise ValueError('Set timestamp_column and at least one asset.')
-    assets = config.get('assets', [])
-    if not assets:
-        raise ValueError('Configure at least one asset.')
+        raise ValueError('Set timestamp_column and at least one unit.')
+    config = normalize_config(config)
+    if not config.get('assets'):
+        raise ValueError('Configure at least one unit with tags.')
     ids = set()
-    for asset in assets:
+    for asset in config['assets']:
         key = asset.get('id', '')
         if not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}', key) or key in ids:
-            raise ValueError('Asset IDs must be unique letters, numbers, hyphens or underscores.')
+            raise ValueError('Unit IDs must be unique letters, numbers, hyphens or underscores.')
         ids.add(key)
-        for field in ('inputs', 'targets'):
-            tags = asset.get(field, [])
-            if not tags or not all(isinstance(t, str) and t.strip() for t in tags) or len(tags) != len(set(tags)):
-                raise ValueError(f'{key}: provide unique {field} tags.')
-        if set(asset['inputs']) & set(asset['targets']):
-            raise ValueError(f'{key}: a target cannot also be an input (target leakage).')
-        gate = asset.get('running')
-        if gate and (not gate.get('tag') or not np.isfinite(float(gate.get('min', 0)))):
-            raise ValueError(f'{key}: running needs a tag and finite minimum.')
-    for field, default, lo, hi in [('poll_seconds', 30, 1, 3600), ('stale_seconds', 180, 1, 86400),
-                                  ('max_skew_seconds', 120, 0, 86400), ('persistence', 3, 1, 100)]:
+        tags = asset.get('tags', [])
+        if not tags or not all(isinstance(t, str) and t.strip() for t in tags) or len(tags) != len(set(tags)):
+            raise ValueError(f'{key}: provide unique numeric tag names.')
+        if asset.get('running') and asset['running'].get('tag') not in tags:
+            raise ValueError('The optional running tag must also be in the unit tag list.')
+    for field, default, lo, hi in [('poll_seconds', 30, 1, 86400), ('stale_seconds', 180, 1, 86400),
+                                  ('max_skew_seconds', 120, 0, 86400), ('persistence', 3, 1, 100),
+                                  ('lookback', 24, 2, 720), ('horizon', 12, 1, 120),
+                                  ('epochs', 10, 1, 1000), ('batch_size', 64, 8, 1024), ('hidden_size', 16, 8, 128)]:
         value = config.get(field, default)
         if not isinstance(value, int) or not lo <= value <= hi:
             raise ValueError(f'{field} must be an integer from {lo} to {hi}.')
+    if config['hidden_size'] % 2:
+        raise ValueError('hidden_size must be even.')
+    if config['device'] not in ('cpu', 'cuda', 'auto'):
+        raise ValueError('device must be cpu, cuda or auto.')
     return config
 
 
 def fingerprint(config):
-    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(normalize_config(config), sort_keys=True).encode()).hexdigest()
 
 
 def all_tags(config):
-    return list(dict.fromkeys(t for a in config['assets'] for t in
-        a['inputs'] + a['targets'] + ([a['running']['tag']] if a.get('running') else [])))
+    return list(dict.fromkeys(t for a in normalize_config(config)['assets'] for t in a['tags']))
+
+
+def numeric_tags(frame, timestamp_column):
+    return [str(t) for t in frame.columns if t != timestamp_column and
+            np.isfinite(pd.to_numeric(frame[t], errors='coerce').to_numpy(dtype=float)).any()]
+
+
+def config_for_frame(frame, config, name='Hydro unit'):
+    config = normalize_config(config)
+    tags = numeric_tags(frame, config['timestamp_column'])
+    if not tags:
+        raise ValueError('No numeric tag columns were found.')
+    config['assets'] = [{'id': 'unit', 'name': name, 'kind': 'Hydro unit', 'tags': tags}]
+    cadence = float(frame[config['timestamp_column']].diff().dt.total_seconds().median())
+    if not np.isfinite(cadence) or cadence <= 0:
+        raise ValueError('At least two distinct timestamps are required.')
+    config['poll_seconds'] = min(86400, max(1, round(cadence)))
+    return validate_config(config)
 
 
 def read_csv(text, timestamp_column, source_timezone=None):
@@ -77,125 +113,121 @@ def read_csv(text, timestamp_column, source_timezone=None):
     return frame.sort_values(timestamp_column).reset_index(drop=True)
 
 
-def train(frame, config):
-    validate_config(config)
+def train(frame, config, progress=lambda message: None):
+    from .forecasting import fit_stack
+    config = validate_config(config)
     missing = set(all_tags(config)) - set(frame.columns)
     if missing:
         raise ValueError('Missing configured tags: ' + ', '.join(sorted(missing)))
+    if len(frame) < 250:
+        raise ValueError('At least 250 rows are required; use substantially more for pilot evaluation.')
+    timestamps = pd.DatetimeIndex(frame[config['timestamp_column']])
+    cadence = float(np.median(np.diff(timestamps.asi8) / 1e9))
+    if cadence <= 0 or not timestamps.is_monotonic_increasing or timestamps.has_duplicates:
+        raise ValueError('Training timestamps must be ordered and unique.')
     models, reports = {}, []
     for asset in config['assets']:
-        tags = asset['inputs'] + asset['targets']
+        raw = frame[asset['tags']].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
         if asset.get('running'):
-            tags = list(dict.fromkeys(tags + [asset['running']['tag']]))
-        numeric = frame[tags].apply(pd.to_numeric, errors='coerce').replace([np.inf, -np.inf], np.nan)
-        valid = numeric.notna().all(axis=1)
-        if asset.get('running'):
-            valid &= numeric[asset['running']['tag']] >= asset['running'].get('min', 0)
-        rows = numeric.loc[valid]
-        if len(rows) < 250:
-            raise ValueError(f"{asset['id']}: need at least 250 complete, running, healthy rows; found {len(rows)}.")
-        n_fit, n_cal = int(len(rows) * .6), int(len(rows) * .8)
-        fit, cal, test = rows.iloc[:n_fit], rows.iloc[n_fit:n_cal], rows.iloc[n_cal:]
-        model = ExtraTreesRegressor(n_estimators=100, min_samples_leaf=3, random_state=42, n_jobs=1)
-        x, y = asset['inputs'], asset['targets']
-        model.fit(fit[x].to_numpy(), fit[y].to_numpy().ravel() if len(y) == 1 else fit[y].to_numpy())
-        def predict(part):
-            return model.predict(part[x].to_numpy()).reshape(len(part), len(y))
-        cal_error = np.abs(cal[y].to_numpy() - predict(cal))
-        # Freeze normal bounds using calibration only; reserve the final block for evaluation.
-        tolerance = np.maximum(np.quantile(cal_error, .99, axis=0), np.maximum(fit[y].std().to_numpy() * .01, 1e-6))
-        test_error = np.abs(test[y].to_numpy() - predict(test))
-        low, high = fit[x].min().to_numpy(), fit[x].max().to_numpy()
-        margin = np.maximum((high - low) * .05, 1e-6)
-        test_x = test[x].to_numpy()
-        in_domain = ((test_x >= low - margin) & (test_x <= high + margin)).all(axis=1)
-        report = {
-            'id': asset['id'], 'name': asset.get('name', asset['id']), 'rows': len(rows),
-            'excluded_rows': len(frame) - len(rows), 'fit_rows': len(fit), 'calibration_rows': len(cal),
-            'test_rows': len(test), 'test_flag_rate': float((test_error / tolerance >= 1).any(axis=1).mean()),
-            'test_out_of_domain_rate': float((~in_domain).mean()),
-            'tags': [{'tag': tag, 'mae': float(test_error[:, i].mean()), 'tolerance': float(tolerance[i])} for i, tag in enumerate(y)],
-            'start': frame.loc[valid, config['timestamp_column']].iloc[0].isoformat(),
-            'end': frame.loc[valid, config['timestamp_column']].iloc[-1].isoformat(),
-        }
-        models[asset['id']] = {'estimator': model, 'tolerance': tolerance, 'low': low - margin, 'high': high + margin}
-        reports.append(report)
-    return {'version': 1, 'created_at': datetime.now(timezone.utc).isoformat(), 'config': config,
-            'config_hash': fingerprint(config), 'models': models, 'reports': reports}
-
-
-def evaluate(bundle, values):
-    output = []
-    for asset in bundle['config']['assets']:
-        base = {'id': asset['id'], 'name': asset.get('name', asset['id']), 'kind': asset.get('kind', 'Asset'), 'signals': []}
-        needed = asset['inputs'] + asset['targets'] + ([asset['running']['tag']] if asset.get('running') else [])
-        bad = [t for t in needed if not isinstance(values.get(t), Real) or isinstance(values.get(t), bool) or not np.isfinite(values[t])]
-        if bad:
-            output.append({**base, 'status': 'data_quality', 'detail': 'Missing or invalid: ' + ', '.join(bad), 'score': None})
-            continue
-        if asset.get('running') and values[asset['running']['tag']] < asset['running'].get('min', 0):
-            output.append({**base, 'status': 'not_running', 'detail': 'Outside configured running condition', 'score': None})
-            continue
-        model = bundle['models'][asset['id']]
-        x = np.array([values[t] for t in asset['inputs']])
-        expected = np.asarray(model['estimator'].predict(x.reshape(1, -1))).reshape(-1)
-        actual = np.array([values[t] for t in asset['targets']])
-        ratios = np.abs(actual - expected) / model['tolerance']
-        signals = [{'tag': tag, 'actual': float(actual[i]), 'expected': float(expected[i]),
-                    'residual': float(actual[i] - expected[i]), 'tolerance': float(model['tolerance'][i]),
-                    'ratio': float(ratios[i])} for i, tag in enumerate(asset['targets'])]
-        outside = [t for i, t in enumerate(asset['inputs']) if x[i] < model['low'][i] or x[i] > model['high'][i]]
-        output.append({**base, 'status': 'out_of_domain' if outside else ('deviation' if ratios.max() >= 1 else 'normal'),
-                       'detail': 'Unseen operating range: ' + ', '.join(outside) if outside else 'Expected behaviour conditioned on operating inputs',
-                       'score': None if outside else float(ratios.max()), 'signals': signals})
-    return output
+            index = asset['tags'].index(asset['running']['tag'])
+            raw[raw[:, index] < asset['running'].get('min', 0)] = np.nan
+        settings = {key: config[key] for key in ('lookback', 'horizon', 'epochs', 'batch_size', 'hidden_size', 'device')}
+        settings['sample_seconds'] = cadence
+        stack, report = fit_stack(raw, timestamps, settings, lambda message: progress(f'{asset.get("name", asset["id"])}: {message}'))
+        models[asset['id']] = stack
+        reports.append({'id': asset['id'], 'name': asset.get('name', asset['id']), 'rows': len(frame),
+                        **{k: v for k, v in report.items() if k not in ('mae', 'baseline_mae', 'tolerance')},
+                        'tags': [{'tag': tag, 'mae': report['mae'][i], 'baseline_mae': report['baseline_mae'][i],
+                                  'tolerance': report['tolerance'][i]} for i, tag in enumerate(asset['tags'])]})
+    return {'version': MODEL_VERSION, 'created_at': datetime.now(timezone.utc).isoformat(), 'config': config,
+            'config_hash': fingerprint(config), 'models': models, 'reports': reports, 'sample_seconds': cadence}
 
 
 class Monitor:
-    def __init__(self, bundle):
+    def __init__(self, bundle, predictor_factory=None):
+        if bundle.get('version') != MODEL_VERSION:
+            raise ValueError('This model uses the previous input/target workflow. Retrain to forecast all tags.')
         self.bundle = bundle
-        self.counts = {}
-        self.last_times = {}
+        if predictor_factory is None:
+            from .forecasting import StackPredictor
+            predictor_factory = StackPredictor
+        self.predictors = {key: predictor_factory(stack) for key, stack in bundle['models'].items()}
+        self.windows, self.pending, self.counts, self.last, self.cache = {}, {}, {}, {}, {}
 
     def score(self, values, times, now, quality=None, live=True):
         config = self.bundle['config']
-        checked = dict(values)
-        reasons = {}
-        for tag in all_tags(config):
-            timestamp = times.get(tag)
-            if quality and quality.get(tag) is not True:
-                reasons[tag] = 'bad PI quality'
-            elif timestamp is None:
-                reasons[tag] = 'missing timestamp'
-            elif live and ((now - timestamp).total_seconds() > config.get('stale_seconds', 180) or (timestamp - now).total_seconds() > 30):
-                reasons[tag] = 'stale or future timestamp'
-            if tag in reasons:
-                checked[tag] = None
-        results = evaluate(self.bundle, checked)
-        for result, asset in zip(results, config['assets']):
-            tags = asset['inputs'] + asset['targets'] + ([asset['running']['tag']] if asset.get('running') else [])
+        output = []
+        cadence = self.bundle['sample_seconds']
+        origin = pd.Timestamp(now).floor(pd.Timedelta(seconds=cadence)) if live else pd.Timestamp(now)
+        for asset in config['assets']:
+            key, tags = asset['id'], asset['tags']
+            signals = [{'tag': t, 'actual': float(values[t]) if isinstance(values.get(t), Real) and not isinstance(values[t], bool) and np.isfinite(values[t]) else None,
+                        'expected': None, 'forecast_issued_at': None, 'residual': None, 'tolerance': None, 'ratio': None,
+                        'status': 'warming_up', 'consecutive': 0, 'forecast': []} for t in tags]
+            result = {'id': key, 'name': asset.get('name', key), 'kind': asset.get('kind', 'Unit'),
+                      'signals': signals, 'timestamp': origin.isoformat(), 'score': None,
+                      'status': 'warming_up', 'detail': '', 'components': {}}
+            bad = {}
+            for signal in signals:
+                tag, stamp = signal['tag'], times.get(signal['tag'])
+                if signal['actual'] is None or stamp is None or (quality is not None and quality.get(tag) is not True):
+                    bad[tag] = 'Missing or bad-quality reading'
+                elif live and ((now - stamp).total_seconds() > config.get('stale_seconds', 180) or (stamp - now).total_seconds() > 30):
+                    bad[tag] = 'Stale or future PI timestamp'
             observed = [times[t] for t in tags if t in times]
             if observed and (max(observed) - min(observed)).total_seconds() > config.get('max_skew_seconds', 120):
-                result.update(status='data_quality', score=None, signals=[], detail='Tag timestamps are not aligned')
-            problems = [f'{t}: {reasons[t]}' for t in tags if t in reasons]
-            if problems:
-                result['detail'] = '; '.join(problems)
-            key = asset['id']
-            stamp = min(observed) if len(observed) == len(tags) else None
-            previous = self.last_times.get(key)
-            fresh = stamp is not None and (previous is None or stamp > previous)
-            if stamp is not None and previous is not None and stamp < previous:
-                result.update(status='data_quality', score=None, signals=[], detail='Out-of-order observation')
-            if result['status'] != 'deviation':
-                self.counts[key] = 0
-            elif fresh:
-                if previous and (stamp - previous).total_seconds() > config.get('stale_seconds', 180):
-                    self.counts[key] = 0
-                self.counts[key] = self.counts.get(key, 0) + 1
-            if fresh:
-                self.last_times[key] = stamp
-            result['consecutive'] = self.counts.get(key, 0)
-            if result['status'] == 'deviation' and result['consecutive'] >= config.get('persistence', 3):
-                result['status'] = 'alert'
-            result['timestamp'] = stamp.isoformat() if stamp else None
-        return results
+                bad.update(dict.fromkeys(tags, 'Tag timestamps are not aligned'))
+            previous = self.last.get(key)
+            if previous and origin < previous['origin']:
+                bad.update(dict.fromkeys(tags, 'Out-of-order observation'))
+            if previous and live and any(times.get(t, previous['times'][t]) < previous['times'][t] for t in tags):
+                bad.update(dict.fromkeys(tags, 'Out-of-order PI reading'))
+            stopped = asset.get('running') and values.get(asset['running']['tag']) is not None and values[asset['running']['tag']] < asset['running'].get('min', 0)
+            if bad or stopped:
+                self.windows[key], self.pending[key], self.counts[key] = [], {}, {}
+                result['status'] = 'data_quality' if bad else 'not_running'
+                result['detail'] = '; '.join(f'{t}: {why}' for t, why in bad.items()) if bad else 'Outside running condition'
+                for signal in signals:
+                    signal['status'] = 'data_quality' if signal['tag'] in bad else ('not_running' if stopped else 'warming_up')
+                self.cache[key] = result
+                output.append(result)
+                continue
+            signature = tuple(times[t] for t in tags)
+            if previous and (origin == previous['origin'] or (live and signature == previous['signature'])):
+                output.append(copy.deepcopy(self.cache[key]))
+                continue
+            gap = previous and abs((origin - previous['origin']).total_seconds() - cadence) > max(.001, cadence * .05)
+            if gap:
+                self.windows[key], self.pending[key], self.counts[key] = [], {}, {}
+            self.last[key] = {'origin': origin, 'signature': signature, 'times': dict(times)}
+            pending = self.pending.get(key, {}).get(origin.isoformat())
+            counts = self.counts.setdefault(key, {})
+            if pending is not None:
+                expected, tolerance, issued_at = pending
+                for i, signal in enumerate(signals):
+                    residual = signal['actual'] - float(expected[i])
+                    ratio = abs(residual) / float(tolerance[i])
+                    counts[signal['tag']] = counts.get(signal['tag'], 0) + 1 if ratio >= 1 else 0
+                    signal.update(expected=float(expected[i]), forecast_issued_at=issued_at, residual=residual, tolerance=float(tolerance[i]), ratio=ratio,
+                                  consecutive=counts[signal['tag']], status='alert' if counts[signal['tag']] >= config.get('persistence', 3) else ('deviation' if ratio >= 1 else 'normal'))
+                result['score'] = max(s['ratio'] for s in signals)
+                result['status'] = 'alert' if any(s['status'] == 'alert' for s in signals) else ('deviation' if result['score'] >= 1 else 'normal')
+                result['detail'] = 'Each actual value is compared with a forecast issued before this observation.'
+            window = self.windows.setdefault(key, [])
+            window.append((origin, [s['actual'] for s in signals]))
+            window[:] = window[-config['lookback']:]
+            if len(window) == config['lookback']:
+                q, future_times, components = self.predictors[key].predict([row[1] for row in window], [row[0] for row in window])
+                tolerance = self.bundle['models'][key]['tolerance']
+                self.pending[key] = {stamp.isoformat(): (q[h, :, 1], tolerance[h], origin.isoformat()) for h, stamp in enumerate(future_times)}
+                result['components'] = components
+                for i, signal in enumerate(signals):
+                    signal['forecast'] = [{'timestamp': stamp.isoformat(), 'expected': float(q[h, i, 1]),
+                                           'lower': float(q[h, i, 0]), 'upper': float(q[h, i, 2])} for h, stamp in enumerate(future_times)]
+                if pending is None:
+                    result['detail'] = 'Forecasts issued for every tag. Waiting for the next actual observation to compare.'
+            else:
+                result['detail'] = f'Collecting history: {len(window)}/{config["lookback"]} observations.'
+            self.cache[key] = copy.deepcopy(result)
+            output.append(result)
+        return output

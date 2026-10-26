@@ -4,3 +4,6 @@ scikit-learn>=1.5,<2
 joblib>=1.4,<2
 requests>=2.32,<3
 openpyxl>=3.1,<4
+torch>=2.3,<3
+lightning>=2.4,<3
+pytorch-forecasting>=1.4,<2

@@ -26,7 +26,8 @@ webapp/.vinext/
 
 # The previous AirSense project is retained locally, not shipped with HydroSense.
 legacy/
-notebooks/
+notebooks/*
+!notebooks/hydrosense_training.ipynb
 src/airsense/
 configs/model.json
 configs/simulation.json
