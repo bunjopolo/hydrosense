@@ -122,7 +122,7 @@ def train(frame, config, progress=lambda message: None, progress_detail=lambda e
     if len(frame) < 250:
         raise ValueError('At least 250 rows are required; use substantially more for pilot evaluation.')
     timestamps = pd.DatetimeIndex(frame[config['timestamp_column']])
-    cadence = float(np.median(np.diff(timestamps.asi8) / 1e9))
+    cadence = float(frame.attrs.get('sample_seconds', np.median(np.diff(timestamps.asi8) / 1e9)))
     if cadence <= 0 or not timestamps.is_monotonic_increasing or timestamps.has_duplicates:
         raise ValueError('Training timestamps must be ordered and unique.')
     models, reports = {}, []
@@ -149,7 +149,8 @@ def train(frame, config, progress=lambda message: None, progress_detail=lambda e
                         'tags': [{'tag': tag, 'mae': report['mae'][i], 'baseline_mae': report['baseline_mae'][i],
                                   'tolerance': report['tolerance'][i]} for i, tag in enumerate(asset['tags'])]})
     return {'version': MODEL_VERSION, 'created_at': datetime.now(timezone.utc).isoformat(), 'config': config,
-            'config_hash': fingerprint(config), 'models': models, 'reports': reports, 'sample_seconds': cadence}
+            'config_hash': fingerprint(config), 'models': models, 'reports': reports, 'sample_seconds': cadence,
+            'training_selection': frame.attrs.get('training_selection')}
 
 
 class Monitor:

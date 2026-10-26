@@ -35,6 +35,23 @@ with tempfile.TemporaryDirectory() as folder:
             with urllib.request.urlopen('http://127.0.0.1:18765' + script) as response:
                 assert 'javascript' in response.headers['Content-Type']
                 assert len(response.read()) > 1000
+            def post(path, data):
+                request = urllib.request.Request('http://127.0.0.1:18765' + path, data=json.dumps(data).encode(),
+                    headers={'Content-Type': 'application/json', 'Origin': 'http://127.0.0.1:18765'})
+                with urllib.request.urlopen(request) as response:
+                    return json.load(response)
+            from datetime import datetime, timezone, timedelta
+            csv = 'timestamp,tag A,tag B\n' + ''.join(
+                f'{(datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=30 * i)).isoformat()},{i},{i * 2}\n'
+                for i in range(320))
+            post('/csv', {'csv': csv, 'purpose': 'training', 'auto_configure': True})
+            with urllib.request.urlopen('http://127.0.0.1:18765/status') as response:
+                revision = json.load(response)['training_revision']
+            preview = post('/training/preview', {'revision': revision})
+            assert len(preview['traces']) == 2
+            assert post('/training/selection', {'revision': revision, 'ranges': [[0, 150], [170, 320]]})['selected_rows'] == 300
+            with urllib.request.urlopen('http://127.0.0.1:18765/export/training?revision=' + revision) as response:
+                assert len(response.read().decode().splitlines()) == 301
             bad = urllib.request.Request('http://127.0.0.1:18765/status', headers={'Origin': 'https://untrusted.invalid'})
             try:
                 urllib.request.urlopen(bad)

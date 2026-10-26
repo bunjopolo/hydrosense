@@ -131,6 +131,35 @@ configuration and durable prediction CSV logs are in ignored `artifacts/hydro/`.
 The dashboard keeps 360 observations and the most recent 200 notifications;
 logs retain the complete run. Notifications are in-app only.
 
+## Visually choose healthy training periods
+
+After importing a training CSV or Excel sheet, **Data & training** shows graphs
+for every numeric column in the file. All rows are included initially.
+
+1. Drag on any graph to mark a range; its outline appears on every graph.
+2. Choose **Include only this range**, **Add range**, or **Exclude range**.
+   You can also clear inclusion and add several healthy periods. Green shading
+   shows included rows; the amber outline is the range currently marked.
+3. Use **Zoom to range** to inspect individual readings, or enter exact start/end
+   row numbers. Graphs use chronological row position; the view's dates are UTC.
+4. Click **Apply training selection**, confirm the included history is healthy,
+   then train. Unsaved selections prevent training. The included-row count is
+   shown next to the training button.
+
+All tags use the same selected rows. Original timestamps and sampling cadence
+are retained: temporal windows cannot bridge excluded intervals. The 60/20/20
+chronological split uses included rows only, and fit/calibration/test each need
+sufficient continuous history. At least 250 included rows are required.
+
+Large-file previews retain bucket minima/maxima and missing-value markers;
+zoom for individual readings. Selection always applies to original rows, never
+to the reduced graph points. Applied selections last for the imported file's
+in-memory session; importing a new file resets inclusion to all rows. The trained
+artifact records selected ranges and counts for auditing.
+
+**Export included CSV** downloads the applied selection with original timestamps
+for notebook/Colab training. Keep the export private along with your plant data.
+
 ## File contract
 
 Wide format: one timestamp column and one column per tag. For example, these

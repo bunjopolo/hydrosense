@@ -269,6 +269,66 @@ class RealModelIntegrationTests(unittest.TestCase):
         self.assertFalse(np.allclose(original, changed))
 
 
+class TrainingSelectionTests(unittest.TestCase):
+    def test_overlap_union_and_strict_boundaries(self):
+        from hydrosense.selection import normalize_ranges
+        self.assertEqual(normalize_ranges([[20, 50], [0, 30], [50, 60]], 100), [[0, 60]])
+        for bad in ([[0, 101]], [[2, 2]], [[-1, 5]], [[False, 10]], [[1.5, 10]], None):
+            with self.assertRaises(ValueError):
+                normalize_ranges(bad, 100)
+
+    def test_preview_retains_spikes_missing_values_and_all_numeric_tags(self):
+        from hydrosense.selection import preview
+        frame = generate(10000)
+        frame.loc[1234, 'U1.MW'] = 99999
+        frame.loc[1235, 'U1.MW'] = np.nan
+        tags = [c for c in frame if c != 'timestamp']
+        result = preview(frame, 'timestamp', tags)
+        json.dumps(result, allow_nan=False)
+        self.assertEqual(len(result['traces']), 10)
+        values = result['traces'][0]['points']
+        self.assertIn([1234, 99999.], values)
+        self.assertIn([1235, None], values)
+        self.assertLessEqual(len(values), 1000)
+        zoom = preview(frame, 'timestamp', tags, 1230, 1240)
+        self.assertEqual(len(zoom['traces'][0]['points']), 10)
+
+    def test_selection_is_bound_to_import_and_empty_never_means_all(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(directory)
+            payload = {'csv': generate(500).to_csv(index=False), 'purpose': 'training', 'auto_configure': True}
+            state.action('/csv', payload)
+            revision = state.training_revision
+            state.action('/training/selection', {'revision': revision, 'ranges': [[0, 200], [300, 500]]})
+            self.assertEqual(state.snapshot()['selected_training_rows'], 400)
+            self.assertEqual(state.snapshot()['training_rows'], 500)
+            state.action('/training/selection', {'revision': revision, 'ranges': []})
+            with self.assertRaisesRegex(ValueError, '250'):
+                state.action('/train', {'healthy_confirmed': True, 'revision': revision})
+            state.action('/csv', payload)
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                state.action('/training/selection', {'revision': revision, 'ranges': [[0, 500]]})
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                state.action('/train', {'healthy_confirmed': True, 'revision': revision})
+            self.assertEqual(state.snapshot()['selected_training_rows'], 500)
+
+    def test_excluded_values_never_fit_and_windows_do_not_bridge_ranges(self):
+        from hydrosense.selection import selected_frame
+        frame = generate(500)
+        frame.loc[200:299, 'U1.MW'] = 1e9
+        config = json.loads((ROOT / 'configs/hydro/assets.json').read_text())
+        config.update(lookback=8, horizon=3, epochs=1, hidden_size=8)
+        config['assets'][0]['tags'] = ['U1.MW']
+        chosen = selected_frame(frame, [[0, 200], [300, 500]], 'timestamp')
+        bundle = train(chosen, config)
+        stack = bundle['models'][config['assets'][0]['id']]
+        self.assertAlmostEqual(stack['mean'][0], chosen.iloc[:240]['U1.MW'].mean())
+        self.assertEqual(bundle['sample_seconds'], 30)
+        self.assertEqual(bundle['reports'][0]['fit_windows'], 219)
+        self.assertEqual(bundle['training_selection']['selected_rows'], 400)
+        self.assertEqual(bundle['training_selection']['ranges'][1]['start_time'], frame.iloc[300].timestamp.isoformat())
+
+
 class PITests(unittest.TestCase):
     def test_live_rejects_cadence_mismatch_before_connecting(self):
         with tempfile.TemporaryDirectory() as directory:

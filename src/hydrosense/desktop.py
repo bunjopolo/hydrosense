@@ -23,7 +23,10 @@ def self_test():
     config.update(lookback=8, horizon=3, epochs=1, hidden_size=8, device='cpu')
     config['assets'] = [{'id': 'test', 'name': 'Packaged model test', 'tags': ['U1.MW', 'U1.GB.TEMP']}]
     frame = generate(320)
-    bundle = train(frame, config, print)
+    from .selection import selected_frame
+    chosen = selected_frame(frame, [[0, 150], [170, 320]], 'timestamp')
+    bundle = train(chosen, config, print)
+    assert bundle['training_selection']['selected_rows'] == 300
     with tempfile.TemporaryDirectory() as directory:
         model = Path(directory) / 'model.joblib'
         joblib.dump(bundle, model)

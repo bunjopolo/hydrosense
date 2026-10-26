@@ -1,3 +1,5 @@
+Now includes visual training-data selection: review every imported tag, drag to include/exclude periods, zoom, apply the selection, and export included rows for Colab.
+
 Windows x64 executable with the dashboard, CPU machine-learning runtime and Windows PI authentication adapter included.
 
 1. Download **HydroSense.exe** below. No GitHub login, Python, Node.js or administrator installation is required.

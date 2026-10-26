@@ -12,7 +12,7 @@ import mimetypes
 from pathlib import Path
 import threading
 import uuid
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, parse_qs
 
 import joblib
 import pandas as pd
@@ -22,6 +22,7 @@ from .demo import generate
 from .model import MODEL_VERSION, Monitor, all_tags, config_for_frame, fingerprint, normalize_config, numeric_tags, train, validate_config
 from .pi import PIClient
 from .runtime import data_directory, resource_root
+from .selection import normalize_ranges, selected_frame, preview
 
 ROOT = resource_root()
 ALLOWED_ORIGINS = {f'http://{host}:{port}' for host in ('localhost', '127.0.0.1') for port in (5173, 3000)}
@@ -50,6 +51,9 @@ class State:
         self.bundle = None
         self.job = {'status': 'idle'}
         self.training = None
+        self.training_ranges = []
+        self.training_revision = None
+        self.training_source = 'csv'
         self.replay = None
         self.replay_index = 0
         self.mode = 'idle'
@@ -83,6 +87,8 @@ class State:
                 'events': self.events, 'migration_note': self.migration_note, 'has_export': self.run_path is not None,
                 'sample_seconds': self.bundle.get('sample_seconds') if self.bundle else None,
                 'training_rows': len(self.training) if self.training is not None else 0,
+                'training_revision': self.training_revision, 'training_ranges': self.training_ranges,
+                'selected_training_rows': sum(end - start for start, end in self.training_ranges),
                 'replay_rows': len(self.replay) if self.replay is not None else 0, 'replay_index': self.replay_index,
                 'model': {'created_at': self.bundle['created_at'], 'reports': self.bundle['reports'],
                           'compatible': fingerprint(self.config) == self.bundle['config_hash']} if self.bundle else None})
@@ -152,7 +158,10 @@ class State:
         self.idle()
         if self.training is None:
             raise ValueError('Import a training CSV first.')
-        config, frame = copy.deepcopy(self.config), self.training.copy()
+        config = copy.deepcopy(self.config)
+        frame = selected_frame(self.training, self.training_ranges, config['timestamp_column'])
+        if len(frame) < 250:
+            raise ValueError('Select at least 250 training rows in sufficiently long continuous ranges.')
         self.job = {'status': 'training', 'percent': 0, 'message': 'Preparing training…'}
         self.mode = 'idle'
         def work():
@@ -167,7 +176,7 @@ class State:
                 progress({'percent': 99, 'message': 'Loading models for prediction…'})
                 monitor = Monitor(bundle)
                 with self.lock:
-                    source = 'synthetic' if demo else 'csv'
+                    source = 'synthetic' if demo or self.training_source == 'synthetic' else 'csv'
                     atomic_json(self.directory / 'active.json', {'file': name, 'source': source})
                     self.bundle = bundle
                     self.monitor = monitor
@@ -188,6 +197,7 @@ class State:
                 self.config = validate_config(data)
                 atomic_json(self.directory / 'config.json', self.config)
                 self.training = self.replay = None
+                self.training_ranges, self.training_revision = [], None
                 self.reset_observations()
                 self.mode = 'idle'
             elif path == '/csv':
@@ -216,10 +226,28 @@ class State:
                         self.monitor = Monitor(self.bundle)
                 else:
                     self.training = frame
+                    self.training_ranges = [[0, len(frame)]]
+                    self.training_revision = uuid.uuid4().hex
+                    self.training_source = 'csv'
                 return {'columns': list(frame.columns), 'rows': len(frame)}
+            elif path in ('/training/preview', '/training/selection'):
+                if self.training is None:
+                    raise ValueError('Import training data first.')
+                if data.get('revision') != self.training_revision:
+                    raise ValueError('Training data changed. Reload the review before selecting rows.')
+                if path == '/training/selection':
+                    self.idle()
+                    self.training_ranges = normalize_ranges(data.get('ranges'), len(self.training))
+                    return {'ranges': self.training_ranges, 'selected_rows': sum(b - a for a, b in self.training_ranges)}
+                return {**preview(self.training, self.config['timestamp_column'],
+                                  numeric_tags(self.training, self.config['timestamp_column']),
+                                  data.get('start', 0), data.get('end')),
+                        'revision': self.training_revision, 'rows': len(self.training)}
             elif path == '/train':
                 if data.get('healthy_confirmed') is not True:
                     raise ValueError('Confirm that training data represents healthy operation.')
+                if 'revision' in data and data['revision'] != self.training_revision:
+                    raise ValueError('Training data changed. Review it again before training.')
                 self.train_async()
             elif path == '/demo':
                 self.idle()
@@ -228,6 +256,9 @@ class State:
                 self.config['epochs'] = 2
                 atomic_json(self.directory / 'config.json', self.config)
                 self.training, self.replay = generate(1200), generate(360, 83, True, '2026-02-01')
+                self.training_ranges = [[0, len(self.training)]]
+                self.training_revision = uuid.uuid4().hex
+                self.training_source = 'synthetic'
                 self.replay_index = 0
                 self.train_async(demo=True)
             elif path == '/replay':
@@ -356,6 +387,23 @@ def handler_for(state, static_directory=None):
             if not self.allowed():
                 return self.send(403, {'error': 'Origin not allowed'})
             path = unquote(urlsplit(self.path).path)
+            if path == '/export/training':
+                with state.lock:
+                    revision = parse_qs(urlsplit(self.path).query).get('revision', [None])[0]
+                    if state.training is None or revision != state.training_revision:
+                        return self.send(409, {'error': 'Training data changed. Review it again before exporting.'})
+                    frame = selected_frame(state.training, state.training_ranges, state.config['timestamp_column'])
+                    if frame.empty:
+                        return self.send(400, {'error': 'No training rows are included.'})
+                    payload = frame.to_csv(index=False).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/csv; charset=utf-8')
+                self.send_header('Content-Disposition', 'attachment; filename=hydrosense-selected-training.csv')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             if static_root and (path == '/' or path.startswith('/assets/')):
                 file = (static_root / ('index.html' if path == '/' else path.lstrip('/'))).resolve()
                 if not file.is_relative_to(static_root) or not file.is_file():
