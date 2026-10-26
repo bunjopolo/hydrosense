@@ -8,9 +8,11 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import mimetypes
 from pathlib import Path
 import threading
 import uuid
+from urllib.parse import unquote, urlsplit
 
 import joblib
 import pandas as pd
@@ -19,8 +21,9 @@ from .data import read_upload
 from .demo import generate
 from .model import MODEL_VERSION, Monitor, all_tags, config_for_frame, fingerprint, normalize_config, numeric_tags, train, validate_config
 from .pi import PIClient
+from .runtime import data_directory, resource_root
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = resource_root()
 ALLOWED_ORIGINS = {f'http://{host}:{port}' for host in ('localhost', '127.0.0.1') for port in (5173, 3000)}
 
 
@@ -32,7 +35,7 @@ def atomic_json(path, value):
 
 class State:
     def __init__(self, directory=None):
-        self.directory = Path(directory or ROOT / 'artifacts/hydro')
+        self.directory = Path(directory or data_directory())
         self.directory.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.config = json.loads((self.directory / 'config.json' if (self.directory / 'config.json').exists() else ROOT / 'configs/hydro/assets.json').read_text())
@@ -316,7 +319,8 @@ class State:
             stop_event.wait(delay)
 
 
-def handler_for(state):
+def handler_for(state, static_directory=None):
+    static_root = Path(static_directory).resolve() if static_directory else None
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass  # Never log CSV payloads, credentials or server addresses.
@@ -324,7 +328,8 @@ def handler_for(state):
         def allowed(self):
             host = self.headers.get('Host', '').split(':')[0]
             origin = self.headers.get('Origin')
-            return host in ('localhost', '127.0.0.1') and (origin is None or origin in ALLOWED_ORIGINS)
+            local_origins = {f'http://{name}:{self.server.server_port}' for name in ('localhost', '127.0.0.1')}
+            return host in ('localhost', '127.0.0.1') and (origin is None or origin in ALLOWED_ORIGINS or (static_root and origin in local_origins))
 
         def send(self, status, body):
             payload = json.dumps(body, allow_nan=False).encode()
@@ -350,6 +355,21 @@ def handler_for(state):
         def do_GET(self):
             if not self.allowed():
                 return self.send(403, {'error': 'Origin not allowed'})
+            path = unquote(urlsplit(self.path).path)
+            if static_root and (path == '/' or path.startswith('/assets/')):
+                file = (static_root / ('index.html' if path == '/' else path.lstrip('/'))).resolve()
+                if not file.is_relative_to(static_root) or not file.is_file():
+                    return self.send(404, {'error': 'Not found'})
+                payload = file.read_bytes()
+                self.send_response(200)
+                kind = 'text/javascript' if file.suffix == '.js' else mimetypes.guess_type(str(file))[0]
+                self.send_header('Content-Type', kind or 'application/octet-stream')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             if self.path == '/export/predictions':
                 with state.lock:
                     payload = state.run_path.read_bytes() if state.run_path else None

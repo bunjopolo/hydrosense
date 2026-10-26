@@ -11,7 +11,8 @@
     "start": "node scripts/run-vinext.mjs start",
     "test": "npm run build && node --test tests/rendered-html.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "build:desktop": "vite build --config vite.desktop.config.ts"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",

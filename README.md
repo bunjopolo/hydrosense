@@ -18,6 +18,35 @@ Upgrading from the earlier selected-target version: update the code, rerun
 `python -m pip install -e .`, and retrain. Old regression artifacts cannot provide
 all-tag temporal forecasts; the app retains them but asks for a new model.
 
+## Windows executable (simplest setup)
+
+Download **HydroSense.exe** from the [latest Windows release](https://github.com/bunjopolo/hydrosense/releases/latest).
+Double-click it and the dashboard opens in your default browser. Python, Node.js
+and Git are bundled or unnecessary on the work computer. Leave the console window
+open while monitoring; closing it stops the app. The large ML runtime unpacks at
+startup, so the first window can take a little time to appear.
+
+Models, settings and run logs are stored in `%LOCALAPPDATA%\HydroSense` and survive
+replacing the executable. To migrate existing local settings/models, close both
+apps and copy the contents of your old `artifacts\hydro` directory into that folder.
+Passwords remain session-only. The Windows integrated PI authentication adapter
+is included. Your computer still needs network access to PI.
+
+For a slower computer, train with the notebook and use the executable for inference.
+While the app is closed, activate your trusted exported model with:
+
+```powershell
+.\HydroSense.exe activate --model C:\path\hydro-model.joblib --trust-model
+```
+
+The pilot executable is unsigned. If company policy blocks it, request IT approval.
+Packaging removes installation steps but does not reduce training CPU or RAM needs.
+
+Maintainers can build and publish a tested executable using the **Windows executable**
+GitHub Actions workflow. It builds the bundled dashboard, installs CPU PyTorch,
+packages with PyInstaller, tests real training/inference inside the executable,
+and publishes a public release with its SHA-256 checksum and dependency versions.
+
 ## Start locally
 
 Python 3.11+ and Node 22.13+ are required. From this directory:

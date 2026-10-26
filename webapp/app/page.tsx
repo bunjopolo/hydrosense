@@ -12,7 +12,8 @@ type Connection = { url?: string; data_server?: string; auth?: string; username?
 type Notice = { id: string; timestamp: string; unit: string; tag: string; status: string; actual: number | null; expected: number | null; ratio: number | null };
 type State = { config: Config; connection: Connection; job: { status: string; error?: string; message?: string; percent?: number }; mode: string; source: string; error: string | null; migration_note?: string; results: Result[]; history: { timestamp: string; assets: Result[] }[]; events: Notice[]; has_export: boolean; sample_seconds: number | null; updated_at: string | null; training_rows: number; replay_rows: number; replay_index: number; model: { created_at: string; reports: Report[]; compatible: boolean } | null };
 type Inspection = { columns: string[]; numeric_columns: string[]; rows: number };
-const API = "http://127.0.0.1:8765";
+declare const __HYDROSENSE_DESKTOP__: boolean;
+const API = typeof __HYDROSENSE_DESKTOP__ !== "undefined" && __HYDROSENSE_DESKTOP__ ? "" : "http://127.0.0.1:8765";
 const COLAB = "https://colab.research.google.com/github/bunjopolo/hydrosense/blob/main/notebooks/hydrosense_training.ipynb";
 const names: Record<string, string> = { normal: "Within baseline", deviation: "Deviation", alert: "Persistent deviation", data_quality: "Data quality", not_running: "Not running", warming_up: "Collecting history" };
 const fmt = (n: number | null | undefined) => n == null ? "—" : n.toLocaleString(undefined, { maximumFractionDigits: 3 });

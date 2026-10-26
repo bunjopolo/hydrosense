@@ -36,3 +36,8 @@ scripts/generate_datasets.py
 scripts/prepare_dashboard_data.py
 tests/test_pipeline.py
 webapp/public/data/
+
+# Packaged application build output
+/build/
+/dist/
+webapp/desktop-dist/

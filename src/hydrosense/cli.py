@@ -56,12 +56,13 @@ def main():
 
 def activate(path, directory=None):
     # joblib is executable serialization. Caller must explicitly trust this model.
-    from .service import ROOT, atomic_json
+    from .service import atomic_json
+    from .runtime import data_directory
     bundle = joblib.load(path)
     if bundle.get('version') != MODEL_VERSION or bundle.get('config_hash') != fingerprint(bundle['config']):
         raise ValueError('Expected a matching all-tag HydroSense model. Retrain with this version.')
     Monitor(bundle)  # Verify all weights and fitted preprocessors before activation.
-    directory = Path(directory or ROOT / 'artifacts/hydro')
+    directory = Path(directory or data_directory())
     directory.mkdir(parents=True, exist_ok=True)
     name = f'model-{uuid.uuid4().hex}.joblib'
     shutil.copyfile(path, directory / name)
