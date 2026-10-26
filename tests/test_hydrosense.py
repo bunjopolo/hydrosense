@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, MagicMock, patch
 
 import joblib
 import numpy as np
@@ -17,7 +17,7 @@ import openpyxl
 from hydrosense.data import read_upload
 from hydrosense.demo import generate
 from hydrosense.model import MODEL_VERSION, Monitor, all_tags, config_for_frame, fingerprint, normalize_config, read_csv, train, validate_config
-from hydrosense.pi import PIClient
+from hydrosense.pi import PIClient, PIconnectClient, create_client
 from hydrosense.service import State
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -330,6 +330,72 @@ class TrainingSelectionTests(unittest.TestCase):
 
 
 class PITests(unittest.TestCase):
+    def test_piconnect_requires_explicit_server_and_no_default_fallback(self):
+        with self.assertRaisesRegex(ValueError, 'server name'):
+            create_client({'connector': 'piconnect'})
+        with self.assertRaisesRegex(ValueError, 'connection method'):
+            create_client({'connector': 'unsupported'})
+        sdk = Mock()
+        sdk.PIServer.servers = {'archive': object()}
+        client = create_client({'connector': 'piconnect', 'data_server': 'unknown'})
+        with patch.object(client, '_load_sdk', return_value=sdk):
+            with self.assertRaisesRegex(ValueError, 'not registered'):
+                client.snapshot(['tag'])
+        sdk.PIServer.assert_not_called()
+
+    def test_piconnect_reads_exact_tags_timestamp_quality_and_partial_failure(self):
+        sdk = MagicMock()
+        sdk.PIServer.servers = {'archive': object()}
+        server = sdk.PIServer.return_value.__enter__.return_value
+        def reading(value=42., good=True, questionable=False, substituted=False, stamp='2026-01-01T00:00:00.1234567Z'):
+            item = Mock(Value=value, IsGood=good, Questionable=questionable, Substituted=substituted)
+            item.Timestamp.UtcTime.ToString.return_value = stamp
+            return Mock(CurrentValue=Mock(return_value=item))
+        tags = ['bearing / temp*?', 'bad', 'questionable', 'substituted', 'digital', 'missing', 'infinite', 'bad time', 'last']
+        sdk.AF.PI.PIPoint.FindPIPoint.side_effect = [
+            reading(), reading(good=False), reading(questionable=True), reading(substituted=True),
+            reading(value='42'), RuntimeError('No point'), reading(value=float('inf')),
+            reading(stamp='2026-01-01T00:00:00'), reading(value=12),
+        ]
+        client = PIconnectClient({'data_server': ' ARCHIVE '})
+        with patch.object(client, '_load_sdk', return_value=sdk):
+            values, times, quality = client.snapshot(tags)
+        sdk.PIServer.assert_called_once_with(server='archive', timeout=20)
+        sdk.AF.PI.PIPoint.FindPIPoint.assert_any_call(server.connection, tags[0])
+        self.assertEqual(quality, {tag: tag in (tags[0], 'last') for tag in tags})
+        self.assertEqual(values[tags[0]], 42.)
+        self.assertEqual(values['last'], 12.)
+        self.assertTrue(all(values[tag] is None for tag in tags[1:-1]))
+        self.assertEqual(times[tags[0]], datetime(2026, 1, 1, microsecond=123456, tzinfo=timezone.utc))
+        self.assertNotIn('bad time', times)
+        sdk.PIServer.return_value.__exit__.assert_called_once()
+
+    def test_piconnect_connection_failure_is_reported(self):
+        sdk = MagicMock()
+        sdk.PIServer.servers = {'archive': object()}
+        sdk.PIServer.return_value.__enter__.side_effect = RuntimeError('SDK error')
+        client = PIconnectClient({'data_server': 'archive'})
+        with patch.object(client, '_load_sdk', return_value=sdk):
+            with self.assertRaisesRegex(ValueError, 'Windows PI access'):
+                client.snapshot(['tag'])
+        with patch('hydrosense.pi.sys.platform', 'darwin'):
+            with self.assertRaisesRegex(ValueError, 'Windows computer'):
+                client._load_sdk()
+
+    def test_piconnect_settings_save_without_sdk_and_discard_web_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(directory)
+            state.secret = 'old-secret'
+            state.action('/connection', {'connector': 'piconnect', 'data_server': 'archive',
+                                        'secret': 'DO-NOT-PERSIST', 'url': 'https://old.invalid', 'auth': 'basic'})
+            self.assertEqual(state.settings, {'connector': 'piconnect', 'data_server': 'archive'})
+            self.assertEqual(state.secret, '')
+            self.assertEqual(State(directory).settings, state.settings)
+            with patch('hydrosense.service.create_client') as factory:
+                factory.return_value.snapshot.return_value = ({'tag': 1}, {}, {'tag': True})
+                self.assertIn('1/1', state.action('/connection/test', {})['message'])
+                factory.assert_called_once_with(state.settings, '')
+
     def test_live_rejects_cadence_mismatch_before_connecting(self):
         with tempfile.TemporaryDirectory() as directory:
             state = State(directory)

@@ -7,7 +7,7 @@ const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"]
 
 export const metadata: Metadata = {
   title: "HydroSense | Asset Intelligence",
-  description: "Train asset models from CSV or Excel history and monitor live PI Web API signals.",
+  description: "Train asset models from CSV or Excel history and monitor live PI signals.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

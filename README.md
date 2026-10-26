@@ -223,6 +223,39 @@ No remaining-life estimate, automatic fault diagnosis or plant control is provid
 
 ## PI connection
 
+Choose **PIconnect / PI AF SDK (Windows)** if you already connect from a Python
+script using a server name. Choose **PI Web API (HTTPS)** if you have a Web API URL.
+Both connectors only read data; neither writes predictions or changes points in PI.
+
+### PIconnect (server name only)
+
+Use the Windows computer and PI AF SDK configuration where PIconnect already
+works. Install the optional adapter in HydroSense's Python environment:
+
+```powershell
+.venv\Scripts\python -m pip install -e ".[pi]"
+```
+
+Restart HydroSense, select **PIconnect / PI AF SDK (Windows)**, enter the same
+server name you pass to `PI.PIServer(server=...)`, and save. Click **Test connection
+& tags**, then **Start live prediction** after training on your plant history.
+The process uses its existing Windows PI access; no Web API URL, username or
+password is needed in this mode. Python, PIconnect and the PI AF SDK must be
+available on the computer running the backend. The SDK is not installed by pip.
+
+Use a server registered in `PI.PIServer.servers`. A fully qualified hostname works
+only if it is a registered name in that setup; it is not automatically a Web API
+endpoint. Unknown names are rejected instead of falling back to another server.
+Server names stay in your local `artifacts/hydro/connection.json`.
+
+The adapter reads each exact point's current value, original UTC timestamp and
+quality flags through the AF SDK. A missing or unreadable point is flagged as a
+data-quality issue while other points continue. Connections are opened and
+closed for each poll; validate polling time for your number of tags during the pilot.
+See [PIconnect connection documentation](https://piconnect.readthedocs.io/en/main/tutorials/piserver.html).
+
+### PI Web API
+
 Enter the HTTPS base URL, Data Archive server and authentication in the app.
 Point names resolve through `GET /points?path=\\\\server\\tag`; an optional tag-to-
 Web-ID dictionary supports pre-resolved point or attribute streams. Current
@@ -255,7 +288,7 @@ receive fresh timestamps can trigger staleness or prevent a new joint snapshot;
 verify this against your archive configuration before the live trial.
 
 PI endpoint references: [AVEVA PI Web API reference](https://docs.aveva.com/bundle/pi-web-api-reference/)
-and your server's `/piwebapi/help` for its installed version. The connector is
+and your server's `/piwebapi/help` for its installed version. Both connectors are
 covered by mocked PI tests; connectivity and authentication must be verified
 against your server when you enter its settings.
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hydrosense"
 version = "0.3.0"
-description = "Tag-driven hydro asset modelling from CSV/Excel and live PI Web API data"
+description = "Tag-driven hydro asset modelling from CSV/Excel and live PI data"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=2.0,<3",
@@ -20,6 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+pi = ["PIconnect>=0.12.4,<0.13; sys_platform == 'win32'"]
 notebooks = ["nbformat>=5.10,<6", "ipykernel>=6.29,<8", "matplotlib>=3.8,<4"]
 
 [tool.setuptools.packages.find]

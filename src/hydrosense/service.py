@@ -20,7 +20,7 @@ import pandas as pd
 from .data import read_upload
 from .demo import generate
 from .model import MODEL_VERSION, Monitor, all_tags, config_for_frame, fingerprint, normalize_config, numeric_tags, train, validate_config
-from .pi import PIClient
+from .pi import create_client
 from .runtime import data_directory, resource_root
 from .selection import normalize_ranges, selected_frame, preview
 
@@ -290,18 +290,21 @@ class State:
                 self.mode = 'replay'
             elif path == '/connection':
                 self.idle()
-                allowed = ('url', 'data_server', 'auth', 'username', 'ca_bundle', 'web_ids')
+                allowed = ('connector', 'url', 'data_server', 'auth', 'username', 'ca_bundle', 'web_ids')
                 settings = {k: data[k] for k in allowed if k in data}
                 secret = data.get('secret', '')
+                if settings.get('connector') == 'piconnect':
+                    settings = {'connector': 'piconnect', 'data_server': settings.get('data_server', '')}
+                    secret = ''
                 # An empty field preserves the in-memory secret only for identical account settings.
-                if not secret and all(settings.get(k) == self.settings.get(k) for k in ('url', 'auth', 'username')):
+                if settings.get('connector') != 'piconnect' and not secret and all(settings.get(k) == self.settings.get(k) for k in ('connector', 'url', 'auth', 'username')):
                     secret = self.secret
-                PIClient(settings, secret)
+                create_client(settings, secret)
                 self.settings, self.secret = settings, secret
                 atomic_json(self.directory / 'connection.json', settings)
             elif path == '/connection/test':
                 self.idle()
-                client = PIClient(self.settings, self.secret)
+                client = create_client(self.settings, self.secret)
                 values, _, quality = client.snapshot(all_tags(self.config))
                 return {'message': f'Connection succeeded. {sum(quality.values())}/{len(values)} tags have good numeric values.', 'quality': quality}
             elif path == '/live/start':
@@ -312,7 +315,7 @@ class State:
                 cadence = self.bundle['sample_seconds']
                 if abs(self.config.get('poll_seconds', 30) - cadence) > max(.001, cadence * .05):
                     raise ValueError(f'PI polling must match the trained sampling cadence ({cadence:g} seconds). Update the configuration and retrain.')
-                client = PIClient(self.settings, self.secret)
+                client = create_client(self.settings, self.secret)
                 self.monitor = Monitor(self.bundle)
                 self.stop_event = threading.Event()
                 self.mode = 'live'
